@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,7 +30,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,9 +37,70 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	for {
+		args := WorkArgs{}
+		reply := Workreply{}
+		ok := call("Coordinator.Schedule", args, reply)
+		if !ok {
+			break
+		}
+		switch reply.jobType {
+		case 0:
+			break
+		case 1:
+			doMap(mapf, reply)
+		case 2:
+			doReduce()
+		}
+		time.Sleep(time.Second)
 
+	}
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+}
+
+func doMap(mapf func(string, string) []KeyValue, reply Workreply) {
+	intermediate := []KeyValue{}
+	filename := reply.filename
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+	intermediate = append(intermediate, kva...)
+
+	buckets := make([][]KeyValue, reply.R)
+	for i := range buckets {
+		buckets[i] = []KeyValue{}
+	}
+	for _, kv := range intermediate {
+		idx := ihash(kv.Key)
+		buckets[idx] = append(buckets[idx], kv)
+	}
+	for i := range buckets {
+		oname := "mr-" + strconv.Itoa(reply.mapID) + "-" + strconv.Itoa(i)
+		ofile, _ := ioutil.TempFile("", oname+"*")
+		enc := json.NewEncoder(ofile)
+		for _, kv := range buckets[i] {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatalf("cannot write into %v", oname)
+			}
+		}
+		os.Rename(ofile.Name(), oname)
+		ofile.Close()
+	}
+	finishedArgs := WorkArgs{reply.mapID, 1}
+	finishedReply := ExampleReply{}
+	call("Master.MapTaskFinished", &finishedArgs, &finishedReply)
+}
+
+func doReduce() {
 
 }
 
