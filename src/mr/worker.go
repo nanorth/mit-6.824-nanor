@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -19,6 +20,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -40,17 +49,23 @@ func Worker(mapf func(string, string) []KeyValue,
 	for {
 		args := WorkArgs{}
 		reply := Workreply{}
-		ok := call("Coordinator.Schedule", args, reply)
+		ok := call("Coordinator.Schedule", &args, &reply)
 		if !ok {
 			break
 		}
-		switch reply.jobType {
+		switch reply.JobType {
 		case 0:
-			break
+			return
 		case 1:
+			//fmt.Println("Get a Map job, working...")
+			//fmt.Printf("Working on job num: %v", reply.MapID)
 			doMap(mapf, reply)
 		case 2:
-			doReduce()
+			//fmt.Println("Get a Reduce job, working...")
+			//fmt.Printf("Working on job num: %v", reply.ReduceID)
+			doReduce(reducef, reply)
+		case 3:
+			continue
 		}
 		time.Sleep(time.Second)
 
@@ -61,7 +76,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func doMap(mapf func(string, string) []KeyValue, reply Workreply) {
 	intermediate := []KeyValue{}
-	filename := reply.filename
+	filename := reply.Filename
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -80,10 +95,10 @@ func doMap(mapf func(string, string) []KeyValue, reply Workreply) {
 	}
 	for _, kv := range intermediate {
 		idx := ihash(kv.Key)
-		buckets[idx] = append(buckets[idx], kv)
+		buckets[idx%reply.R] = append(buckets[idx%reply.R], kv)
 	}
 	for i := range buckets {
-		oname := "mr-" + strconv.Itoa(reply.mapID) + "-" + strconv.Itoa(i)
+		oname := "mr-" + strconv.Itoa(reply.MapID) + "-" + strconv.Itoa(i)
 		ofile, _ := ioutil.TempFile("", oname+"*")
 		enc := json.NewEncoder(ofile)
 		for _, kv := range buckets[i] {
@@ -95,13 +110,62 @@ func doMap(mapf func(string, string) []KeyValue, reply Workreply) {
 		os.Rename(ofile.Name(), oname)
 		ofile.Close()
 	}
-	finishedArgs := WorkArgs{reply.mapID, 1}
-	finishedReply := ExampleReply{}
-	call("Master.MapTaskFinished", &finishedArgs, &finishedReply)
+	finishedArgs := WorkArgs{reply.MapID, 1}
+	finishedReply := Workreply{}
+	call("Coordinator.MapTaskFinished", &finishedArgs, &finishedReply)
 }
 
-func doReduce() {
+func doReduce(reducef func(string, []string) string, reply Workreply) {
+	intermediate := []KeyValue{}
+	for i := 0; i < reply.M; i++ {
+		iname := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reply.ReduceID)
+		file, err := os.Open(iname)
+		if err != nil {
+			log.Fatalf("cannot open %v", file)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
 
+	sort.Sort(ByKey(intermediate))
+	// output file
+	oname := "mr-out-" + strconv.Itoa(reply.ReduceID)
+	ofile, _ := os.Create(oname)
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-Y.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+	ofile.Close()
+
+	// send the finish message to master
+	finishedArgs := WorkArgs{reply.ReduceID, 1}
+	finishedReply := Workreply{}
+	call("Coordinator.ReduceTaskFinished", &finishedArgs, &finishedReply)
 }
 
 //

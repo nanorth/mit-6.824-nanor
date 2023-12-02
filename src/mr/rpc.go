@@ -23,13 +23,15 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type StatusCode int
+
 type Workreply struct {
-	jobType  int // 0:
-	filename string
-	mapID    int
-	reduceID int
+	JobType  int // 0: done, 1: map, 2: reduce 3: wait
+	MapID    int
+	ReduceID int
 	M        int //M map tasks
 	R        int //R reduce tasks
+	Filename string
 }
 
 type WorkArgs struct {
