@@ -10,10 +10,12 @@ package main
 // Please do not change this file.
 //
 
-import "6.824/mr"
+import (
+	"6.824/mr"
+	"fmt"
+	"os"
+)
 import "plugin"
-import "os"
-import "fmt"
 import "log"
 
 func main() {
@@ -21,7 +23,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: mrworker xxx.so\n")
 		os.Exit(1)
 	}
-
+	//fmt.Println("os agrs are finee")
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	mr.Worker(mapf, reducef)
