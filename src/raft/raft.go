@@ -222,6 +222,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	if args.Term == rf.currentTerm && rf.state == Candidate {
+		rf.setState(Follower, args.Term)
+	}
+	if args.Term > rf.currentTerm {
+		rf.setState(Follower, args.Term)
+	}
 	reply.Success = true
 }
 
@@ -312,8 +318,11 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		switch rf.state {
-		case Follower:
-
+		case Leader:
+			// SEND HEARTBEAT
+			rf.BroadcastHeartbeat()
+			time.Sleep(time.Millisecond * time.Duration(HEATBEAT))
+		default:
 			if rf.startElection {
 				rf.Election()
 			} else {
@@ -321,15 +330,10 @@ func (rf *Raft) ticker() {
 				rf.startElection = true
 				//rf.mu.Unlock()
 			}
-
 			rand.Seed(time.Now().UnixNano())
 			randomNumber := rand.Intn(TIMEOUTHIGH-TIMEOUTLOW+1) + TIMEOUTLOW
 			DPrintf("{Node %v} will sleep %v millisecond", rf.me, randomNumber)
 			time.Sleep(time.Millisecond * time.Duration(randomNumber))
-		case Leader:
-			// SEND HEARTBEAT
-			rf.BroadcastHeartbeat()
-			time.Sleep(time.Millisecond * time.Duration(HEATBEAT))
 		}
 	}
 }
@@ -340,7 +344,13 @@ func (rf *Raft) resetElectionTimer() {
 
 func (rf *Raft) Election() {
 	DPrintf("{Node %v} become candidate in term %v", rf.me, rf.currentTerm)
+	rf.mu.Lock()
 	rf.state = Candidate
+	rf.currentTerm++
+	rf.voteFor = rf.me
+	rf.grantedVote = 1
+	rf.mu.Unlock()
+	rf.resetElectionTimer()
 	var waitElectionDone sync.WaitGroup
 	for server := range rf.peers {
 		if server == rf.me {
@@ -363,9 +373,8 @@ func (rf *Raft) Election() {
 						rf.grantedVote++
 						rf.mu.Unlock()
 						if rf.grantedVote > len(rf.peers)/2 {
-							rf.setState(Leader, rf.currentTerm+1)
+							rf.setState(Leader, rf.currentTerm)
 							DPrintf("{Node %v} receives majority votes in term %v and become leader", rf.me, rf.currentTerm)
-
 						}
 
 					} else if rf.currentTerm < reply.Term {
@@ -383,7 +392,6 @@ func (rf *Raft) Election() {
 }
 
 func (rf *Raft) BroadcastHeartbeat() {
-	DPrintf("[term %d]:Raft [%d] is leader !", rf.currentTerm, rf.me)
 	rf.mu.Lock()
 	for server := range rf.peers {
 		if server == rf.me {
