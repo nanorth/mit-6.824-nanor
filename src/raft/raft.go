@@ -192,43 +192,51 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-
+	rf.mu.Lock()
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		rf.mu.Unlock()
 		return
 	}
 
 	if args.Term > rf.currentTerm {
+		rf.mu.Unlock()
 		rf.setState(Follower, args.Term)
+		rf.mu.Lock()
 	}
 
-	rf.mu.Lock()
 	rf.voteFor = args.CandidateId
-	rf.resetElectionTimer()
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
+	rf.resetElectionTimer()
 	rf.mu.Unlock()
+
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	rf.resetElectionTimer()
-	rf.mu.Unlock()
 
+	rf.mu.Lock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		rf.mu.Unlock()
 		return
 	}
 	if args.Term == rf.currentTerm && rf.state == Candidate {
+		rf.mu.Unlock()
 		rf.setState(Follower, args.Term)
+		rf.mu.Lock()
 	}
 	if args.Term > rf.currentTerm {
+		rf.mu.Unlock()
 		rf.setState(Follower, args.Term)
+		rf.mu.Lock()
 	}
+	rf.resetElectionTimer()
 	reply.Success = true
+	rf.mu.Unlock()
 }
 
 //
@@ -326,13 +334,13 @@ func (rf *Raft) ticker() {
 			if rf.startElection {
 				rf.Election()
 			} else {
-				//rf.mu.Lock()
+				rf.mu.Lock()
 				rf.startElection = true
-				//rf.mu.Unlock()
+				rf.mu.Unlock()
 			}
 			rand.Seed(time.Now().UnixNano())
 			randomNumber := rand.Intn(TIMEOUTHIGH-TIMEOUTLOW+1) + TIMEOUTLOW
-			DPrintf("{Node %v} will sleep %v millisecond", rf.me, randomNumber)
+			//DPrintf("{Node %v} will sleep %v millisecond", rf.me, randomNumber)
 			time.Sleep(time.Millisecond * time.Duration(randomNumber))
 		}
 	}
@@ -343,14 +351,14 @@ func (rf *Raft) resetElectionTimer() {
 }
 
 func (rf *Raft) Election() {
-	DPrintf("{Node %v} become candidate in term %v", rf.me, rf.currentTerm)
 	rf.mu.Lock()
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.voteFor = rf.me
 	rf.grantedVote = 1
-	rf.mu.Unlock()
 	rf.resetElectionTimer()
+	DPrintf("{Node %v} become candidate in term %v", rf.me, rf.currentTerm)
+	rf.mu.Unlock()
 	var waitElectionDone sync.WaitGroup
 	for server := range rf.peers {
 		if server == rf.me {
@@ -383,6 +391,8 @@ func (rf *Raft) Election() {
 					}
 
 				}
+			} else {
+
 			}
 		}(server)
 	}
@@ -392,7 +402,7 @@ func (rf *Raft) Election() {
 }
 
 func (rf *Raft) BroadcastHeartbeat() {
-	rf.mu.Lock()
+	DPrintf("{Node %v} is BroadcastHeartbeat in term %v", rf.me, rf.currentTerm)
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
@@ -404,15 +414,16 @@ func (rf *Raft) BroadcastHeartbeat() {
 			// Make the RPC call
 			reply := AppendEntriesReply{}
 			rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+			if reply.Success == false && reply.Term > rf.currentTerm {
+				rf.setState(Follower, reply.Term)
+				DPrintf("{Node %v} find himself outdated and he is now follower in term %v", rf.me, rf.currentTerm)
+			}
 		}(server)
-
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) setState(state State, term int) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	switch state {
 	case Follower:
 		rf.state = Follower
@@ -422,9 +433,10 @@ func (rf *Raft) setState(state State, term int) {
 	case Leader:
 		rf.state = Leader
 		rf.currentTerm = term
-		rf.voteFor = -1
 		rf.grantedVote = 0
 	}
+	rf.resetElectionTimer()
+	rf.mu.Unlock()
 }
 
 //
