@@ -63,6 +63,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type Entry struct {
+	Term    int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -80,6 +85,14 @@ type Raft struct {
 	voteFor       int
 	startElection bool // true if receive rpc / heartbeat
 	grantedVote   int  // count for grantedVotes
+	// 2B
+	logs        []Entry
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
+	logIndex    int // current logIndex
+
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -161,8 +174,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -177,8 +192,12 @@ type RequestVoteReply struct {
 
 type AppendEntriesArgs struct {
 	// Your data here (2A,2B).
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Entry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -288,11 +307,22 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := rf.state == Leader
+
+	if !isLeader {
+		return index, term, isLeader
+	}
 
 	// Your code here (2B).
+	index = rf.logIndex
+	rf.logIndex++
+	term = rf.currentTerm
+	rf.logs = append(rf.logs, Entry{Term: term, Command: command})
+	isLeader = true
 
 	return index, term, isLeader
 }
@@ -411,6 +441,8 @@ func (rf *Raft) BroadcastHeartbeat() {
 			args := AppendEntriesArgs{}
 			args.Term = rf.currentTerm
 			args.LeaderId = rf.me
+			args.LeaderCommit = rf.commitIndex
+			args.Entries = rf.logs[rf.logIndex:]
 			// Make the RPC call
 			reply := AppendEntriesReply{}
 			rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
