@@ -36,9 +36,10 @@ const (
 	Candidate              // 2
 )
 
-const HEATBEAT int = 100   // leader send heatbit per 150ms
-const TIMEOUTLOW int = 300 // the timeout period randomize between 500ms - 1000ms
+const HEATBEAT int = 100   // leader send heatbeat
+const TIMEOUTLOW int = 300 // the timeout period randomize between 300ms - 600ms
 const TIMEOUTHIGH int = 600
+const CHECKLOG int = 15
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -72,7 +73,7 @@ type Entry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -211,20 +212,21 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
+	rf.mu.RLock()
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.voteFor != -1 && rf.voteFor != args.CandidateId) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		return
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.mu.Unlock()
-		rf.setState(Follower, args.Term)
-		rf.mu.Lock()
+		rf.mu.RUnlock()
+		rf.setStateWithLock(Follower, args.Term)
+		rf.mu.RLock()
 	}
-
+	rf.mu.RUnlock()
+	rf.mu.Lock()
 	rf.voteFor = args.CandidateId
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
@@ -236,23 +238,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
 
-	rf.mu.Lock()
+	rf.mu.RLock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		rf.mu.Unlock()
+		rf.mu.RLock()
 		return
 	}
 	if args.Term == rf.currentTerm && rf.state == Candidate {
-		rf.mu.Unlock()
-		rf.setState(Follower, args.Term)
-		rf.mu.Lock()
+		rf.mu.RUnlock()
+		rf.setStateWithLock(Follower, args.Term)
+		rf.mu.RLock()
 	}
 	if args.Term > rf.currentTerm {
-		rf.mu.Unlock()
-		rf.setState(Follower, args.Term)
-		rf.mu.Lock()
+		rf.mu.RUnlock()
+		rf.setStateWithLock(Follower, args.Term)
+		rf.mu.RLock()
 	}
+	rf.mu.RUnlock()
+	rf.mu.Lock()
 	rf.resetElectionTimer()
 	reply.Success = true
 	rf.mu.Unlock()
@@ -362,7 +366,7 @@ func (rf *Raft) ticker() {
 			time.Sleep(time.Millisecond * time.Duration(HEATBEAT))
 		default:
 			if rf.startElection {
-				rf.Election()
+				go rf.ElectionWithLock()
 			} else {
 				rf.mu.Lock()
 				rf.startElection = true
@@ -380,13 +384,13 @@ func (rf *Raft) resetElectionTimer() {
 	rf.startElection = false
 }
 
-func (rf *Raft) Election() {
+func (rf *Raft) ElectionWithLock() {
 	rf.mu.Lock()
+	rf.resetElectionTimer()
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.voteFor = rf.me
 	rf.grantedVote = 1
-	rf.resetElectionTimer()
 	DPrintf("{Node %v} become candidate in term %v", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 	var waitElectionDone sync.WaitGroup
@@ -398,29 +402,35 @@ func (rf *Raft) Election() {
 		go func(server int) {
 			defer waitElectionDone.Done()
 			args := RequestVoteArgs{}
+			reply := RequestVoteReply{}
+
+			rf.mu.RLock()
 			args.Term = rf.currentTerm
 			args.CandidateId = rf.me
-			reply := RequestVoteReply{}
+			rf.mu.Unlock()
 			ok := rf.sendRequestVote(server, &args, &reply)
 			DPrintf("{Node %v} try to get {Node %v}'s votes in term %v", rf.me, server, rf.currentTerm)
 			if ok {
+				rf.mu.Lock()
 				if rf.currentTerm == args.Term && rf.state == Candidate {
 					DPrintf("{Node %v} get a reply from {Node %v}: %v", rf.me, server, reply)
 					if reply.VoteGranted {
-						rf.mu.Lock()
 						rf.grantedVote++
-						rf.mu.Unlock()
 						if rf.grantedVote > len(rf.peers)/2 {
-							rf.setState(Leader, rf.currentTerm)
+							rf.mu.Unlock()
+							rf.setStateWithLock(Leader, rf.currentTerm)
 							DPrintf("{Node %v} receives majority votes in term %v and become leader", rf.me, rf.currentTerm)
+							rf.mu.Lock()
 						}
 
 					} else if rf.currentTerm < reply.Term {
+						rf.mu.Unlock()
 						DPrintf("{Node %v} finds a new leader {Node %v} with term %v ", rf.me, server, reply.Term)
-						rf.setState(Follower, reply.Term)
+						rf.setStateWithLock(Follower, reply.Term)
+						rf.mu.Lock()
 					}
-
 				}
+				rf.mu.Unlock()
 			} else {
 
 			}
@@ -439,22 +449,51 @@ func (rf *Raft) BroadcastHeartbeat() {
 		}
 		go func(server int) {
 			args := AppendEntriesArgs{}
+			reply := AppendEntriesReply{}
+
+			rf.mu.RLock()
+			nextIndx := rf.nextIndex[server]
+			logIndex := rf.logIndex
 			args.Term = rf.currentTerm
 			args.LeaderId = rf.me
+			args.PrevLogIndex = nextIndx - 1
+			args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 			args.LeaderCommit = rf.commitIndex
-			args.Entries = rf.logs[rf.logIndex:]
+			args.Entries = rf.logs[nextIndx:]
+			rf.mu.RUnlock()
 			// Make the RPC call
-			reply := AppendEntriesReply{}
 			rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-			if reply.Success == false && reply.Term > rf.currentTerm {
-				rf.setState(Follower, reply.Term)
-				DPrintf("{Node %v} find himself outdated and he is now follower in term %v", rf.me, rf.currentTerm)
+			rf.mu.Lock()
+			if reply.Success == false {
+				if reply.Term > rf.currentTerm {
+					rf.mu.Unlock()
+					rf.setStateWithLock(Follower, reply.Term)
+					DPrintf("{Node %v} find himself outdated and he is now follower in term %v", rf.me, rf.currentTerm)
+					rf.mu.Lock()
+				} else {
+					rf.nextIndex[server]--
+				}
+			} else {
+				rf.nextIndex[server] = logIndex
+				rf.matchIndex[server] = logIndex
 			}
+			rf.mu.Unlock()
 		}(server)
 	}
 }
 
-func (rf *Raft) setState(state State, term int) {
+//func (rf *Raft) BoardCastLog() {
+//	//DPrintf("{Node %v} is BroadcastHeartbeat in term %v", rf.me, rf.currentTerm)
+//	for {
+//		if rf.state != Leader {
+//			return
+//		}
+//		go rf.BroadcastHeartbeat()
+//		time.Sleep(time.Duration(CHECKLOG) * time.Millisecond)
+//	}
+//}
+
+func (rf *Raft) setStateWithLock(state State, term int) {
 	rf.mu.Lock()
 	switch state {
 	case Follower:
