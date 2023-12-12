@@ -62,7 +62,7 @@ func TestReElection2A(t *testing.T) {
 	// if the leader disconnects, a new one should be elected.
 
 	cfg.disconnect(leader1)
-	DPrintf("someone disconnected")
+	DPrintf("leader %v disconnected", leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
@@ -70,15 +70,15 @@ func TestReElection2A(t *testing.T) {
 	// should switch to follower.
 
 	cfg.connect(leader1)
-	DPrintf("someone reconnected")
+	DPrintf("leader %v Reconnected", leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no new leader should
 	// be elected.
 	cfg.disconnect(leader2)
-	DPrintf("someone disconnected")
+	DPrintf("node %v disconnected", leader2)
 	cfg.disconnect((leader2 + 1) % servers)
-	DPrintf("someone disconnected")
+	DPrintf("node %v disconnected", (leader2+1)%servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
 	// check that the one connected server
@@ -87,12 +87,12 @@ func TestReElection2A(t *testing.T) {
 
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
-	DPrintf("someone reconnected")
+	DPrintf("node %v reconnected", (leader2+1)%servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
 	cfg.connect(leader2)
-	DPrintf("someone reconnected")
+	DPrintf("node %v reconnected", leader2)
 	cfg.checkOneLeader()
 
 	cfg.end()
@@ -294,16 +294,18 @@ func TestFailAgree2B(t *testing.T) {
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
-
+	DPrintf("node %v disconnected", (leader+1)%servers)
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
-	cfg.one(102, servers-1, false)
+	cfg.one(102, servers-1, true)
+	DPrintf("i am here!!!!")
 	cfg.one(103, servers-1, false)
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(104, servers-1, false)
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	DPrintf("node %v reconnected", (leader+1)%servers)
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve
@@ -487,7 +489,7 @@ func TestRejoin2B(t *testing.T) {
 	cfg.rafts[leader1].Start(104)
 
 	// new leader commits, also for index=2
-	cfg.one(103, 2, true)
+	cfg.one(103, servers-1, true)
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()

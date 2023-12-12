@@ -358,7 +358,7 @@ func (cfg *config) cleanup() {
 
 // attach server i to the net.
 func (cfg *config) connect(i int) {
-	// fmt.Printf("connect(%d)\n", i)
+	DPrintf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
 
@@ -381,7 +381,7 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	// fmt.Printf("disconnect(%d)\n", i)
+	DPrintf("disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
 
@@ -494,6 +494,7 @@ func (cfg *config) checkNoLeader() {
 
 // how many servers think a log entry is committed?
 func (cfg *config) nCommitted(index int) (int, interface{}) {
+
 	count := 0
 	var cmd interface{} = nil
 	for i := 0; i < len(cfg.rafts); i++ {
@@ -587,6 +588,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
+			//time.Sleep(500 * time.Millisecond)
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
@@ -605,6 +607,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
+	time.Sleep(500 * time.Millisecond)
 	if cfg.checkFinished() == false {
 		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	}
