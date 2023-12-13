@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"math"
 	"math/rand"
 
@@ -39,8 +41,8 @@ const (
 )
 
 const HEATBEAT int = 100   // leader send heatbeat
-const TIMEOUTLOW int = 200 // the timeout period randomize between 300ms - 600ms
-const TIMEOUTHIGH int = 600
+const TIMEOUTLOW int = 300 // the timeout period randomize between 300ms - 600ms
+const TIMEOUTHIGH int = 900
 const APPLYCHECKER int = 20
 
 //
@@ -125,6 +127,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -136,17 +145,14 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if d.Decode(&rf.currentTerm) != nil ||
+		d.Decode(&rf.voteFor) != nil || d.Decode(&rf.logs) != nil {
+		DPrintf("something went wrong when decoding")
+	}
 }
 
 //
@@ -220,20 +226,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.mu.Unlock()
 		return
 	}
-	if args.LastLogTerm < rf.logs[rf.getLastLogIndex()].Term || (args.LastLogTerm == rf.logs[rf.getLastLogIndex()].Term && args.LastLogIndex < rf.getLastLogIndex()) {
+	if args.Term > rf.currentTerm {
+		rf.setState(Follower, args.Term)
+	}
+	if args.LastLogTerm <= rf.logs[rf.getLastLogIndex()].Term && (args.LastLogTerm != rf.logs[rf.getLastLogIndex()].Term || args.LastLogIndex < rf.getLastLogIndex()) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		rf.mu.Unlock()
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.setState(Follower, args.Term)
-	}
 
 	rf.voteFor = args.CandidateId
+	rf.persist()
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
-	rf.resetElectionTimer()
+	//rf.resetElectionTimer()
 	rf.mu.Unlock()
 
 }
@@ -262,6 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	//todo: fix here
 	argIdx := 0
+	presist := false
 	for index := args.PrevLogIndex + 1; index <= rf.getLastLogIndex(); {
 		if argIdx >= len(args.Entries) {
 			break
@@ -270,6 +278,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.logs = rf.logs[:index]
 			rf.logs = append(rf.logs, args.Entries[argIdx:]...)
 			argIdx = len(args.Entries)
+			presist = true
 			break
 		}
 		index++
@@ -277,7 +286,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if argIdx < len(args.Entries) {
 		rf.logs = append(rf.logs, args.Entries[argIdx:]...)
+		presist = true
+
 	}
+	if presist {
+		rf.persist()
+	}
+
 	// cant guarantee, maybe out of if
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.getLastLogIndex())))
@@ -357,6 +372,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = true
 	DPrintf("user add a command on index %v", index)
 
+	rf.persist()
+
 	return index, term, isLeader
 }
 
@@ -397,8 +414,9 @@ func (rf *Raft) ticker() {
 
 			}
 			rf.mu.Unlock()
+			//cant use this stupid trick!!!!!!!!!too much split votes! my bad, this might be fine
 			rand.Seed(time.Now().UnixNano())
-			randomNumber := rand.Intn(TIMEOUTHIGH-TIMEOUTLOW+1) + TIMEOUTLOW
+			randomNumber := rand.Intn(TIMEOUTHIGH-TIMEOUTLOW) + TIMEOUTLOW
 			//DPrintf("{Node %v} will sleep %v millisecond", rf.me, randomNumber)
 			time.Sleep(time.Millisecond * time.Duration(randomNumber))
 		} else {
@@ -432,6 +450,7 @@ func (rf *Raft) ElectionWithLock() {
 	rf.voteFor = rf.me
 	rf.grantedVote = 1
 	DPrintf("{Node %v} become candidate in term %v", rf.me, rf.currentTerm)
+	rf.persist()
 	Term := rf.currentTerm
 	CandidateId := rf.me
 	LastLogIndex := rf.getLastLogIndex()
@@ -455,6 +474,7 @@ func (rf *Raft) ElectionWithLock() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				//DPrintf("{Node %v}get {Node %v}'s votes in term %v,", rf.me, server, args.Term)
+
 				if rf.currentTerm == args.Term && rf.state == Candidate {
 					//DPrintf("{Node %v} get a reply from {Node %v}: %v", rf.me, server, reply)
 					if reply.VoteGranted {
@@ -466,7 +486,7 @@ func (rf *Raft) ElectionWithLock() {
 							rf.BroadcastHeartbeat()
 						}
 					} else if rf.currentTerm < reply.Term {
-						DPrintf("{Node %v} finds a new leader {Node %v} with term %v ", rf.me, server, reply.Term)
+						DPrintf("{Node %v} finds a newer {Node %v} with term %v ", rf.me, server, reply.Term)
 						rf.setState(Follower, reply.Term)
 					}
 				}
@@ -548,6 +568,7 @@ func (rf *Raft) setState(state State, term int) {
 		rf.matchIndex = make([]int, len(rf.peers))
 		//rf.BoardCastLog()
 	}
+	rf.persist()
 	//rf.resetElectionTimer()
 }
 
@@ -618,8 +639,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = append(rf.logs, Entry{Term: 0})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-
-	rf.resetElectionTimer()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
