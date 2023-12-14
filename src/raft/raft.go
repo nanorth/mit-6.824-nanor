@@ -211,6 +211,9 @@ type AppendEntriesReply struct {
 	// Your data here (2A,2B).
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 //
@@ -261,8 +264,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	//DPrintf("Node %v log is %v", rf.me, rf.logs)
 	//DPrintf("args.Entries is %v, prvidx is %v", args.Entries, args.PrevLogIndex)
-	if args.PrevLogIndex > rf.getLastLogIndex() || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Success = false
+		reply.XLen = len(rf.logs)
+		reply.XTerm = -1
+		rf.resetElectionTimer()
+		rf.mu.Unlock()
+		return
+	}
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XLen = len(rf.logs)
+		reply.XTerm = rf.logs[args.PrevLogIndex].Term
+		for index, log := range rf.logs {
+			if log.Term == reply.XTerm {
+				reply.XIndex = index
+				break
+			}
+		}
 		rf.resetElectionTimer()
 		rf.mu.Unlock()
 		return
@@ -531,9 +550,25 @@ func (rf *Raft) BroadcastHeartbeat() {
 						rf.setState(Follower, reply.Term)
 						DPrintf("{Node %v} find himself outdated and he is now follower in term %v", rf.me, rf.currentTerm)
 					} else {
-						if rf.nextIndex[server] > 1 {
-							rf.nextIndex[server]--
+						if reply.XTerm == -1 {
+							rf.nextIndex[server] = reply.XLen
+						} else {
+							containsXTerm := -1
+							for index, log := range rf.logs {
+								if log.Term == reply.XTerm {
+									containsXTerm = index
+								}
+							}
+							if containsXTerm == -1 {
+								rf.nextIndex[server] = reply.XIndex
+							} else {
+								rf.nextIndex[server] = containsXTerm
+							}
 						}
+						if rf.nextIndex[server] == 0 {
+							rf.nextIndex[server]++
+						}
+
 					}
 				} else {
 					rf.nextIndex[server] = nextIndex + len(args.Entries)
