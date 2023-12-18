@@ -20,6 +20,7 @@ package raft
 import (
 	"6.824/labgob"
 	"bytes"
+	"math"
 	"math/rand"
 
 	//	"bytes"
@@ -137,6 +138,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
 	e.Encode(rf.logs)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -150,7 +153,13 @@ func (rf *Raft) persistAndSnapshot() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
+
+	if len(rf.snapshot) == 0 {
+		rf.persister.SaveStateAndSnapshot(data, nil)
+	} else {
+		rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
+	}
+
 }
 
 //
@@ -168,7 +177,8 @@ func (rf *Raft) readPersist(data []byte) {
 	//DPrintf("readpersist hold the lock")
 	defer rf.mu.Unlock()
 	if d.Decode(&rf.currentTerm) != nil ||
-		d.Decode(&rf.voteFor) != nil || d.Decode(&rf.logs) != nil {
+		d.Decode(&rf.voteFor) != nil || d.Decode(&rf.logs) != nil ||
+		d.Decode(&rf.lastIncludedIndex) != nil || d.Decode(&rf.lastIncludedTerm) != nil {
 		DPrintf("something went wrong when decoding")
 	}
 }
@@ -193,6 +203,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	//DPrintf("snapshot hold the lock")
 	defer rf.mu.Unlock()
+	if index > rf.commitIndex || index <= rf.lastIncludedIndex {
+		return
+	}
 	entry := rf.indexToEntry(index)
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = rf.logs[entry].Term
@@ -420,77 +433,121 @@ func (rf *Raft) BroadcastHeartbeat() {
 			continue
 		}
 
-		go func(server int) {
-			args := AppendEntriesArgs{}
-			reply := AppendEntriesReply{}
-			//DPrintf("NextIndex: %v", rf.nextIndex[server])
-			nextIndex := nextIndexes[server]
-			args.Term = Term
-			args.LeaderId = LeaderId
-			args.PrevLogIndex = nextIndex - 1
-			args.PrevLogTerm = logs[args.PrevLogIndex-LastLogIncluded].Term
-			args.LeaderCommit = LeaderCommit
-			args.Entries = logs[(nextIndex - LastLogIncluded):]
-
-			// Make the RPC call
-			ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-			if ok {
+		if rf.nextIndex[server] <= rf.lastIncludedIndex {
+			installSnapshotArgs := InstallSnapshotArgs{
+				Term:             rf.currentTerm,
+				LeaderId:         rf.me,
+				LastIncludeIndex: rf.lastIncludedIndex,
+				LastIncludedTerm: rf.lastIncludedTerm,
+				Data:             rf.snapshot,
+			}
+			installSnapshotReply := InstallSnapshotReply{}
+			go func(server int) {
+				ok := rf.sendSnapShot(server, &installSnapshotArgs, &installSnapshotReply)
 				rf.mu.Lock()
-				//DPrintf("append hold the lock")
-				if reply.Success == false {
-					if reply.Term > rf.currentTerm {
-						rf.setState(Follower, reply.Term)
-						DPrintf("{Node %v} find himself outdated and he is now follower in term %v", rf.me, rf.currentTerm)
+				DPrintf("node %v installsnapshot to node %v", rf.me, server)
+				if ok {
+					if installSnapshotReply.Term > rf.currentTerm {
+						rf.setState(Follower, installSnapshotReply.Term)
 					} else {
-						if reply.XTerm == -1 {
-							rf.nextIndex[server] = reply.XLen + 1 + rf.lastIncludedIndex
-						} else {
-							containsXTerm := -1
-							for index, log := range rf.logs {
-								if log.Term == reply.XTerm {
-									containsXTerm = index
-								}
-							}
-							if containsXTerm == -1 {
-								rf.nextIndex[server] = reply.XIndex + rf.lastIncludedIndex
-								if rf.nextIndex[server] == 0 {
-									rf.nextIndex[server]++
-								}
-							} else {
-								rf.nextIndex[server] = containsXTerm + rf.lastIncludedTerm
-								if rf.nextIndex[server] == 0 {
-									rf.nextIndex[server]++
-								}
-							}
+						rf.nextIndex[server] = int(math.Max(float64(LastLogIncluded+1), float64(rf.nextIndex[server])))
+						rf.matchIndex[server] = int(math.Max(float64(LastLogIncluded), float64(rf.matchIndex[server])))
+						if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
+							rf.offset = 100
 						}
-						if rf.nextIndex[server] < rf.lastIncludedIndex {
-							installSnapshotArgs := InstallSnapshotArgs{
-								Term:             rf.currentTerm,
-								LeaderId:         rf.me,
-								LastIncludeIndex: rf.lastIncludedIndex,
-								LastIncludedTerm: rf.lastIncludedTerm,
-								Data:             rf.snapshot,
-							}
-							installSnapshotReply := InstallSnapshotReply{}
-							go func(server int) {
-								ok := rf.sendSnapShot(server, &installSnapshotArgs, &installSnapshotReply)
-								rf.mu.Lock()
-								//DPrintf("installsnaoshot hold the lock")
-								if ok && installSnapshotReply.Term > rf.currentTerm {
-									rf.setState(Follower, installSnapshotReply.Term)
-								}
-								rf.mu.Unlock()
-							}(server)
-						}
-
 					}
-				} else {
-					rf.nextIndex[server] = nextIndex + len(args.Entries)
-					rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 				}
 				rf.mu.Unlock()
-			}
-		}(server)
+			}(server)
+		} else {
+			go func(server int) {
+				args := AppendEntriesArgs{}
+				reply := AppendEntriesReply{}
+				//DPrintf("NextIndex: %v", rf.nextIndex[server])
+				nextIndex := nextIndexes[server]
+				args.Term = Term
+				args.LeaderId = LeaderId
+				args.PrevLogIndex = nextIndex - 1
+				args.PrevLogTerm = logs[args.PrevLogIndex-LastLogIncluded].Term
+				args.LeaderCommit = LeaderCommit
+				args.Entries = logs[(nextIndex - LastLogIncluded):]
+
+				// Make the RPC call
+				ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+				if ok {
+					rf.mu.Lock()
+					//DPrintf("append hold the lock")
+					if reply.Success == false {
+						if reply.Term > rf.currentTerm {
+							rf.setState(Follower, reply.Term)
+							DPrintf("{Node %v} find himself outdated and he is now follower in term %v", rf.me, rf.currentTerm)
+						} else {
+							if reply.XTerm == -1 {
+								rf.nextIndex[server] = reply.XLen + 1
+								if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
+									rf.offset = 100
+								}
+							} else {
+								containsXTerm := -1
+								for index, log := range rf.logs {
+									if log.Term == reply.XTerm {
+										containsXTerm = index
+									}
+								}
+								if containsXTerm == -1 {
+									rf.nextIndex[server] = reply.XIndex
+									if rf.nextIndex[server] == 0 {
+										rf.nextIndex[server]++
+									}
+									if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
+										rf.offset = 100
+									}
+								} else {
+									rf.nextIndex[server] = containsXTerm + rf.lastIncludedTerm
+									if rf.nextIndex[server] == 0 {
+										rf.nextIndex[server]++
+									}
+									if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
+										rf.offset = 100
+									}
+								}
+							}
+							//if rf.nextIndex[server] <= rf.lastIncludedIndex {
+							//	installSnapshotArgs := InstallSnapshotArgs{
+							//		Term:             rf.currentTerm,
+							//		LeaderId:         rf.me,
+							//		LastIncludeIndex: rf.lastIncludedIndex,
+							//		LastIncludedTerm: rf.lastIncludedTerm,
+							//		Data:             rf.snapshot,
+							//	}
+							//	installSnapshotReply := InstallSnapshotReply{}
+							//	go func(server int) {
+							//		ok := rf.sendSnapShot(server, &installSnapshotArgs, &installSnapshotReply)
+							//		rf.mu.Lock()
+							//		DPrintf("node %v installsnapshot to node %v", rf.me, server)
+							//		if ok {
+							//			if installSnapshotReply.Term > rf.currentTerm {
+							//				rf.setState(Follower, installSnapshotReply.Term)
+							//			} else {
+							//				rf.nextIndex[server] = int(math.Max(float64(LastLogIncluded+1), float64(rf.nextIndex[server])))
+							//				rf.matchIndex[server] = int(math.Max(float64(LastLogIncluded), float64(rf.matchIndex[server])))
+							//			}
+							//		}
+							//		rf.mu.Unlock()
+							//	}(server)
+							//}
+						}
+					} else {
+						rf.nextIndex[server] = nextIndex + len(args.Entries)
+						rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+						if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
+							rf.offset = 100
+						}
+					}
+					rf.mu.Unlock()
+				}
+			}(server)
+		}
 	}
 	//DPrintf("{Node %v} finish a BroadcastHeartbeat in term %v", rf.me, rf.currentTerm)
 	//DPrintf("{Node %v}'s matchIndexes %v", rf.me, rf.matchIndex)
@@ -533,28 +590,34 @@ func (rf *Raft) apply() {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		//DPrintf("apply hold the lock")
-		commitIndex := rf.commitIndex
-		for N := range rf.logs[rf.indexToEntry(commitIndex+1):] {
-			count := 1
-			for index, matchIndex := range rf.matchIndex {
-				if index == rf.me {
-					continue
-				}
-				if matchIndex > N+commitIndex {
-					count++
-					if count > len(rf.peers)/2 && rf.logs[rf.indexToEntry(N+commitIndex+1)].Term == rf.currentTerm {
-						rf.commitIndex = N + 1 + commitIndex
-						break
+		if rf.lastIncludedTerm > rf.commitIndex {
+			rf.commitIndex = rf.lastIncludedIndex
+			rf.lastApplied = rf.lastIncludedIndex
+		} else {
+			commitIndex := rf.commitIndex
+			for N := range rf.logs[rf.indexToEntry(commitIndex+1):] {
+				count := 1
+				for index, matchIndex := range rf.matchIndex {
+					if index == rf.me {
+						continue
+					}
+					if matchIndex > N+commitIndex {
+						count++
+						if count > len(rf.peers)/2 && rf.logs[rf.indexToEntry(N+commitIndex+1)].Term == rf.currentTerm {
+							rf.commitIndex = N + 1 + commitIndex
+							break
+						}
 					}
 				}
 			}
 		}
+
 		appliedMsgs := []ApplyMsg{}
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			msg := ApplyMsg{CommandValid: true, CommandIndex: rf.lastApplied, Command: rf.logs[rf.indexToEntry(rf.lastApplied)].Command}
 			appliedMsgs = append(appliedMsgs, msg)
-			//DPrintf("Node %v apply command %v", rf.me, rf.lastApplied)
+			DPrintf("Node %v apply command %v", rf.me, rf.lastApplied)
 		}
 		rf.mu.Unlock()
 		for _, msg := range appliedMsgs {
@@ -597,8 +660,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = append(rf.logs, Entry{Term: 0})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
 	rf.lastIncludedIndex = 0
-	rf.lastIncludedTerm = -1
+	rf.lastIncludedTerm = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

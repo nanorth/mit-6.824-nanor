@@ -108,7 +108,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//DPrintf("args.Entries is %v, prvidx is %v", args.Entries, args.PrevLogIndex)
 	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Success = false
-		reply.XLen = len(rf.logs) - 1
+		reply.XLen = len(rf.logs) + rf.lastIncludedIndex - 1
 		reply.XTerm = -1
 		rf.resetElectionTimer()
 		rf.mu.Unlock()
@@ -116,11 +116,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if rf.logs[rf.indexToEntry(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		reply.Success = false
-		reply.XLen = len(rf.logs) - 1
+		reply.XLen = len(rf.logs) + rf.lastIncludedIndex - 1
 		reply.XTerm = rf.logs[rf.indexToEntry(args.PrevLogIndex)].Term
 		for index, log := range rf.logs {
 			if log.Term == reply.XTerm {
 				reply.XIndex = index
+				index += rf.lastIncludedIndex
 				break
 			}
 		}
@@ -128,7 +129,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.mu.Unlock()
 		return
 	}
-	//todo: fix here
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		alreadySnapshotLogLen := rf.lastIncludedIndex - args.PrevLogIndex
+		if alreadySnapshotLogLen <= len(args.Entries) {
+			newArgs := &AppendEntriesArgs{
+				Term:         args.Term,
+				LeaderId:     args.LeaderId,
+				PrevLogTerm:  rf.lastIncludedTerm,
+				PrevLogIndex: rf.lastIncludedIndex,
+				Entries:      args.Entries[alreadySnapshotLogLen:],
+				LeaderCommit: args.LeaderCommit,
+			}
+			args = newArgs
+		} else {
+			reply.Success = true
+			return
+		}
+	}
 	argIdx := 0
 	presist := false
 	for index := args.PrevLogIndex + 1; index <= rf.getLastLogIndex(); {
@@ -178,11 +195,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if rf.lastIncludedTerm == args.LastIncludedTerm && rf.lastIncludedIndex == args.LastIncludeIndex {
 		return
 	}
-
+	newLogs := make([]Entry, 0)
+	newLogs = append(newLogs, Entry{Term: 0})
+	if rf.getLastLogIndex() >= args.LastIncludeIndex {
+		newLogs = append(newLogs, rf.logs[rf.indexToEntry(args.LastIncludeIndex)+1:]...)
+	}
+	rf.logs = newLogs
 	rf.snapshot = make([]byte, 0)
 	rf.snapshot = args.Data
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	rf.lastIncludedIndex = args.LastIncludeIndex
+	rf.commitIndex = int(math.Max(float64(args.LastIncludeIndex), float64(rf.commitIndex)))
+	rf.lastApplied = int(math.Max(float64(args.LastIncludeIndex), float64(rf.lastApplied)))
 	rf.persistAndSnapshot()
 
 	go func() {
