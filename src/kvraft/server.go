@@ -18,11 +18,16 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+}
+
+type ClientOperation struct {
+	SequenceNum int
+	Value       string
+	Success     bool
 }
 
 type KVServer struct {
@@ -35,15 +40,23 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	lastClientOperations map[int64]ClientOperation
 }
 
-
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+func (kv *KVServer) KVRequest(args *KVRequest, reply *KVReply) {
 	// Your code here.
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	_, state := kv.rf.GetState()
+	if !state {
+		reply.Status = false
+		return
+	}
+	value, exists := kv.lastClientOperations[args.ClientId]
+	if exists && (value.SequenceNum == args.SequenceNum) {
+		reply.Response = kv.lastClientOperations[args.ClientId].Value
+		reply.Status = true
+		return
+	}
+	kv.rf.Start(args.Command)
 }
 
 //
