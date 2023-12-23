@@ -114,7 +114,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.mu.Unlock()
 		return
 	}
-	if rf.logs[rf.indexToEntry(args.PrevLogIndex)].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= rf.lastIncludedIndex && rf.logs[rf.indexToEntry(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.XLen = len(rf.logs) + rf.lastIncludedIndex - 1
 		reply.XTerm = rf.logs[rf.indexToEntry(args.PrevLogIndex)].Term
@@ -143,6 +143,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args = newArgs
 		} else {
 			reply.Success = true
+			rf.mu.Unlock()
 			return
 		}
 	}
@@ -191,7 +192,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	rf.setState(Follower, args.Term)
 	rf.resetElectionTimer()
-
+	if rf.lastIncludedIndex > args.LastIncludeIndex {
+		return
+	}
 	if rf.lastIncludedTerm == args.LastIncludedTerm && rf.lastIncludedIndex == args.LastIncludeIndex {
 		return
 	}

@@ -15,12 +15,6 @@ type Clerk struct {
 	//mu            sync.Mutex
 }
 
-type Command struct {
-	Op    string
-	Key   string
-	Value string
-}
-
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -34,33 +28,25 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.currentLeader = 0
 	ck.me = nrand()
-	ck.sequenceNum = 0
+	ck.sequenceNum = 1
 	return ck
 }
 
-type KVRequest struct {
-	ClientId    int64
-	SequenceNum int
-	Command     Command
-}
-
-type KVReply struct {
-	Status   bool
-	Response string
-}
-
-func (ck *Clerk) sendKVRequest(server int, args *KVRequest, reply *KVReply) string {
-	ok := ck.servers[server].Call("KVServer.KVRequest", args, reply)
-	if ok && reply.Status == true {
-		return reply.Response
-	}
+func (ck *Clerk) sendKVRequest(args *KVRequest, reply *KVReply) string {
 	for {
-		for index, _ := range ck.servers {
-			ok = ck.servers[index].Call("KVServer.KVRequest", args, reply)
-			if ok && reply.Status == true {
-				return reply.Response
+		ok := ck.servers[ck.currentLeader].Call("KVServer.KVRequest", args, reply)
+
+		if !ok || reply.Status == ErrWrongLeader || reply.Status == ErrTimeout {
+			if !ok {
+				//DPrintf("client can't find server %v", ck.currentLeader)
+			} else {
+				//DPrintf("client get an %v reply", reply)
 			}
+			ck.currentLeader = (ck.currentLeader + 1) % len(ck.servers)
+			continue
 		}
+		//DPrintf("REPLY: %v", reply)
+		return reply.Response
 	}
 }
 
@@ -77,7 +63,7 @@ func (ck *Clerk) sendKVRequest(server int, args *KVRequest, reply *KVReply) stri
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	value := ck.PutAppend(key, "", "get")
+	value := ck.ClientCommand(key, "", "Get")
 	// You will have to modify this function.
 	return value
 }
@@ -86,24 +72,26 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 //
 // you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+// ok := ck.servers[i].Call("KVServer.ClientCommand", &args, &reply)
 //
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 //
-func (ck *Clerk) PutAppend(key string, value string, op string) string {
+func (ck *Clerk) ClientCommand(key string, value string, op string) string {
 	// You will have to modify this function.
-	ck.sequenceNum++
-	args := KVRequest{ClientId: ck.me, SequenceNum: ck.sequenceNum, Command: Command{Op: op, Key: key, Value: value}}
+	args := KVRequest{Command: Command{Op: op, Key: key, Value: value, ClientID: ck.me, SequenceNum: ck.sequenceNum}}
+	//DPrintf("client %v send a %v request, command is key: %v value: %v", ck.me, op, key, value)
 	reply := KVReply{}
-	response := ck.sendKVRequest(ck.currentLeader, &args, &reply)
+	response := ck.sendKVRequest(&args, &reply)
+	ck.sequenceNum++
+	//DPrintf("client get a response: %v", response)
 	return response
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.ClientCommand(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.ClientCommand(key, value, "Append")
 }

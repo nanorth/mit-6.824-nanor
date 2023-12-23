@@ -4,12 +4,15 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
+const TIMEOUT = 200
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,20 +21,14 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
-
 type ClientOperation struct {
 	SequenceNum int
 	Value       string
-	Success     bool
+	Success     Err
 }
 
 type KVServer struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -41,22 +38,91 @@ type KVServer struct {
 
 	// Your definitions here.
 	lastClientOperations map[int64]ClientOperation
+	memoryKV             MemoryKV
+	replyClientChans     map[int]chan KVReply
+	lastApplied          int
 }
 
 func (kv *KVServer) KVRequest(args *KVRequest, reply *KVReply) {
 	// Your code here.
-	_, state := kv.rf.GetState()
-	if !state {
-		reply.Status = false
+	kv.mu.RLock()
+	value, exists := kv.lastClientOperations[args.Command.ClientID]
+	if args.Command.Op != "Get" && exists && (value.SequenceNum == args.Command.SequenceNum) {
+		reply.Response = value.Value
+		reply.Status = Err(OK)
+		DPrintf("args: %v is duplicate", args)
+		kv.mu.RUnlock()
 		return
 	}
-	value, exists := kv.lastClientOperations[args.ClientId]
-	if exists && (value.SequenceNum == args.SequenceNum) {
-		reply.Response = kv.lastClientOperations[args.ClientId].Value
-		reply.Status = true
+	kv.mu.RUnlock()
+	index, _, success := kv.rf.Start(args.Command)
+	if !success {
+		reply.Status = ErrWrongLeader
 		return
 	}
-	kv.rf.Start(args.Command)
+	kv.mu.Lock()
+	ch, exists := kv.replyClientChans[index]
+	if !exists {
+		kv.replyClientChans[index] = make(chan KVReply, 1)
+		ch = kv.replyClientChans[index]
+	}
+
+	kv.mu.Unlock()
+
+	select {
+	case notice := <-ch:
+		reply.Response = notice.Response
+		reply.Status = notice.Status
+	case <-time.After(TIMEOUT * time.Millisecond):
+		reply.Status = ErrTimeout
+	}
+	go func() {
+		kv.mu.Lock()
+		delete(kv.replyClientChans, index)
+		kv.mu.Unlock()
+	}()
+	return
+}
+
+func (kv *KVServer) applyToClients() {
+	for {
+		applyMsg := <-kv.applyCh
+		if applyMsg.CommandValid {
+			kv.mu.Lock()
+			command := applyMsg.Command.(Command)
+			if applyMsg.CommandIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				continue
+			}
+			kv.lastApplied = applyMsg.CommandIndex
+			response := ""
+			status := Err(OK)
+			if command.Op != "Get" && kv.lastClientOperations[command.ClientID].SequenceNum == command.SequenceNum {
+				response = kv.lastClientOperations[command.ClientID].Value
+				status = kv.lastClientOperations[command.ClientID].Success
+			} else {
+				response, status = kv.memoryKV.doCommand(command)
+				kv.lastClientOperations[command.ClientID] = ClientOperation{Value: response, Success: status, SequenceNum: command.SequenceNum}
+			}
+			if term, isLeader := kv.rf.GetState(); isLeader && applyMsg.CommandTerm == term {
+				_, exists := kv.replyClientChans[applyMsg.CommandIndex]
+				if !exists {
+					ch := make(chan KVReply, 1)
+					kv.replyClientChans[applyMsg.CommandIndex] = ch
+				}
+				kv.replyClientChans[applyMsg.CommandIndex] <- KVReply{Response: response, Status: status}
+			}
+			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+				kv.snapShot(applyMsg.CommandIndex)
+			}
+			kv.mu.Unlock()
+		} else if applyMsg.SnapshotValid {
+			kv.mu.Lock()
+			kv.InstallSnapShot(applyMsg.Snapshot)
+			kv.lastApplied = applyMsg.SnapshotIndex
+			kv.mu.Unlock()
+		}
+	}
 }
 
 //
@@ -80,6 +146,29 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) InstallSnapShot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var stateMachine MemoryKV
+	var lastOperations map[int64]ClientOperation
+	if d.Decode(&stateMachine) != nil ||
+		d.Decode(&lastOperations) != nil {
+		DPrintf("something went wrong when decoding")
+	}
+	kv.memoryKV, kv.lastClientOperations = stateMachine, lastOperations
+}
+
+func (kv *KVServer) snapShot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.memoryKV)
+	e.Encode(kv.lastClientOperations)
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -97,18 +186,22 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(Command{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.lastApplied = 0
+	kv.memoryKV = MemoryKV{KV: make(map[string]string)}
+	kv.lastClientOperations = make(map[int64]ClientOperation)
+	kv.replyClientChans = make(map[int]chan KVReply)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.InstallSnapShot(persister.ReadSnapshot())
 	// You may need initialization code here.
-
+	go kv.applyToClients()
 	return kv
 }

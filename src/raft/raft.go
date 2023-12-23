@@ -42,8 +42,8 @@ const (
 
 const HEATBEAT int = 100   // leader send heatbeat
 const TIMEOUTLOW int = 300 // the timeout period randomize between 300ms - 600ms
-const TIMEOUTHIGH int = 900
-const APPLYCHECKER int = 100
+const TIMEOUTHIGH int = 600
+const APPLYCHECKER int = 20
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -60,6 +60,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -292,8 +293,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.nextIndex[rf.me]++
 	//rf.matchIndex[rf.me]++
 	isLeader = true
-	DPrintf("user is adding a command on index %v", index)
+	//DPrintf("user is adding a command on index %v", index)
 	rf.persist()
+	rf.BroadcastHeartbeat()
 	//DPrintf("user finished add a command on index %v", index)
 	return index, term, isLeader
 }
@@ -452,9 +454,6 @@ func (rf *Raft) BroadcastHeartbeat() {
 					} else {
 						rf.nextIndex[server] = int(math.Max(float64(LastLogIncluded+1), float64(rf.nextIndex[server])))
 						rf.matchIndex[server] = int(math.Max(float64(LastLogIncluded), float64(rf.matchIndex[server])))
-						if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
-							rf.offset = 100
-						}
 					}
 				}
 				rf.mu.Unlock()
@@ -496,7 +495,7 @@ func (rf *Raft) BroadcastHeartbeat() {
 								}
 								if containsXTerm == -1 {
 									rf.nextIndex[server] = reply.XIndex
-									if rf.nextIndex[server] == 0 {
+									if rf.nextIndex[server] == rf.getLastLogIndex() {
 										rf.nextIndex[server]++
 									}
 									if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
@@ -504,7 +503,7 @@ func (rf *Raft) BroadcastHeartbeat() {
 									}
 								} else {
 									rf.nextIndex[server] = containsXTerm + rf.lastIncludedTerm
-									if rf.nextIndex[server] == 0 {
+									if rf.nextIndex[server] == rf.getLastLogIndex() {
 										rf.nextIndex[server]++
 									}
 									if rf.nextIndex[server] > rf.getLastLogIndex()+1 {
@@ -615,7 +614,7 @@ func (rf *Raft) apply() {
 		appliedMsgs := []ApplyMsg{}
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			msg := ApplyMsg{CommandValid: true, CommandIndex: rf.lastApplied, Command: rf.logs[rf.indexToEntry(rf.lastApplied)].Command}
+			msg := ApplyMsg{CommandValid: true, CommandIndex: rf.lastApplied, Command: rf.logs[rf.indexToEntry(rf.lastApplied)].Command, CommandTerm: rf.currentTerm}
 			appliedMsgs = append(appliedMsgs, msg)
 			DPrintf("Node %v apply command %v", rf.me, rf.lastApplied)
 		}
@@ -626,6 +625,10 @@ func (rf *Raft) apply() {
 		time.Sleep(time.Millisecond * time.Duration(APPLYCHECKER))
 	}
 
+}
+
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
 }
 
 //
